@@ -3003,6 +3003,7 @@ if test "$srcdir" = "."; then
   else
     multi_basedir="$srcdir/$with_multisrctop.."
   fi
+  multi_basedir="$srcdir/.."
 else
   multi_basedir="$srcdir/.."
 fi
