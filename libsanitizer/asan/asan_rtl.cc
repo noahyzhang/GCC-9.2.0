@@ -448,6 +448,8 @@ static void AsanInitInternal() {
   MaybeStartBackgroudThread();
   SetSoftRssLimitExceededCallback(AsanSoftRssLimitExceededCallback);
 
+  init_user_real_allocate();
+
   // On Linux AsanThread::ThreadStart() calls malloc() that's why asan_inited
   // should be set to 1 prior to initializing the threads.
   asan_inited = 1;

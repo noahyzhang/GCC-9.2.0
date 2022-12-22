@@ -29,7 +29,49 @@
 #include "sanitizer_common/sanitizer_quarantine.h"
 #include "lsan/lsan_common.h"
 
+#include <dlfcn.h>
+#include <stdlib.h>
+
+unsigned int WRAP_ALLOCATE_MIN_BYTE_val = 32;
+unsigned int WRAP_ALLOCATE_MAX_BYTE_val = 48;
+
+// 通过环境变量获取 WRAP_ALLOCATE_MAX_BYTE、WRAP_ALLOCATE_MIN_BYTE
+static __attribute__((constructor)) void init_user_env() {
+  const char* max_wrap_allocate = getenv("WRAP_ALLOCATE_MAX_BYTE");
+  if (max_wrap_allocate != nullptr) {
+     WRAP_ALLOCATE_MAX_BYTE_val = std::atoi(max_wrap_allocate);
+  }
+  const char* min_wrap_allocate = getenv("WRAP_ALLOCATE_MIN_BYTE");
+  if (min_wrap_allocate != nullptr) {
+    WRAP_ALLOCATE_MIN_BYTE_val = std::atoi(min_wrap_allocate);
+  }
+}
+
 namespace __asan {
+
+malloc_type real_malloc = nullptr;
+free_type real_free = nullptr;
+cfree_type real_cfree = nullptr;
+calloc_type real_calloc = nullptr;
+realloc_type real_realloc = nullptr;
+memalign_type real_memalign = nullptr;
+posix_memalign_type real_posix_memalign = nullptr;
+aligned_alloc_type real_aligned_alloc = nullptr;
+valloc_type real_valloc = nullptr;
+pvalloc_type real_pvalloc = nullptr;
+malloc_usable_size_type real_malloc_usable_size = nullptr;
+
+size_t my_malloc_usable_size(void* mem) {
+  mchunkptr p;
+  if (mem != 0) {
+    p = mem2chunk(mem);
+    if (chunk_is_mmapped(p))
+      return chunksize(p) - 2*SIZE_SZ;
+    else if (inuse(p))
+      return chunksize(p) - SIZE_SZ;
+  }
+  return 0;
+}
 
 // Valid redzone sizes are 16, 32, 64, ... 2048, so we encode them in 3 bits.
 // We use adaptive redzones: for larger allocation larger redzones are used.
@@ -974,6 +1016,86 @@ void asan_mz_force_unlock() {
 
 void AsanSoftRssLimitExceededCallback(bool limit_exceeded) {
   instance.SetRssLimitExceeded(limit_exceeded);
+}
+
+void init_user_real_allocate() {
+    real_malloc = reinterpret_cast<malloc_type>(dlsym(RTLD_NEXT, "malloc"));
+    real_free = reinterpret_cast<free_type>(dlsym(RTLD_NEXT, "free"));
+    real_cfree = reinterpret_cast<cfree_type>(dlsym(RTLD_NEXT, "cfree"));
+    real_calloc = reinterpret_cast<calloc_type>(dlsym(RTLD_NEXT, "calloc"));
+    real_realloc = reinterpret_cast<realloc_type>(dlsym(RTLD_NEXT, "realloc"));
+    real_memalign = reinterpret_cast<memalign_type>(dlsym(RTLD_NEXT, "memalign"));
+    real_posix_memalign = reinterpret_cast<posix_memalign_type>(dlsym(RTLD_NEXT, "posix_memalign"));
+    real_aligned_alloc = reinterpret_cast<aligned_alloc_type>(dlsym(RTLD_NEXT, "aligned_alloc"));
+    real_valloc = reinterpret_cast<valloc_type>(dlsym(RTLD_NEXT, "valloc"));
+    real_pvalloc = reinterpret_cast<pvalloc_type>(dlsym(RTLD_NEXT, "pvalloc"));
+    real_malloc_usable_size = reinterpret_cast<malloc_usable_size_type>(dlsym(RTLD_NEXT, "malloc_usable_size"));
+}
+
+#include <stdio.h>
+
+// 判断内存是否是通过 asan_malloc 申请
+bool check_malloced_by_asan(void* mem) {
+  struct ChunkHeader* p_chunk_header = (struct ChunkHeader*)((char*)mem - 16);
+  // printf("chunk_header: %p\n", p_chunk_header);
+
+  // 校验chunk_state
+  int chunk_state = p_chunk_header->chunk_state;
+  // if (chunk_state != CHUNK_AVAILABLE && chunk_state != CHUNK_ALLOCATED && chunk_state != CHUNK_QUARANTINE) {
+  //   return false;
+  // }
+  if (chunk_state != CHUNK_ALLOCATED) {
+    return false;
+  }
+
+  // 校验alloc_type
+  int alloc_type = p_chunk_header->alloc_type;
+  if (alloc_type != FROM_MALLOC && alloc_type != FROM_NEW && alloc_type != FROM_NEW_BR) {
+    return false;
+  }
+
+  // 校验request_size
+  int user_requested_size = p_chunk_header->user_requested_size;
+
+  // 在ThreadLocal中创建的，都是用ASAN，但是大小不在这个范围内。
+  // if (user_requested_size <= WRAP_ALLOCATE_MIN_BYTE_val || user_requested_size > WRAP_ALLOCATE_MAX_BYTE_val) {
+  //   return false;
+  // }
+
+  // 校验rz_log，对于size<=48的内存，rz_log为0
+  int rz_log = p_chunk_header->rz_log;
+  int rz_log_computed = instance.ComputeRZLog(user_requested_size);
+  if (rz_log != rz_log_computed) {
+    return false;
+  }
+  return true;
+}
+
+// old malloc by asan, new by glibc malloc
+void* realloc_asan_to_glibc_malloc(void *ptr, uptr size, BufferedStackTrace* stack) {
+  void* new_ptr = real_malloc(size);
+
+  uptr p = reinterpret_cast<uptr>(ptr);
+  uptr chunk_beg = p - kChunkHeaderSize;
+  AsanChunk *m = reinterpret_cast<AsanChunk *>(chunk_beg);
+
+  uptr memcpy_size = Min(size, m->UsedSize());
+  CHECK_NE(REAL(memcpy), nullptr);
+  REAL(memcpy)(new_ptr, ptr, memcpy_size);
+  asan_free(ptr, stack, FROM_MALLOC);
+  return new_ptr;
+}
+
+// old malloc by glibc malloc, new by asan
+void* realloc_glibc_to_asan_malloc(void *ptr, uptr size, BufferedStackTrace* stack) {
+  void* new_ptr = asan_malloc(size, stack);
+  // TODO: compute size of ptr
+  uptr memcpy_size = my_malloc_usable_size(ptr);
+  // printf("malloc_usable_size: %llu, ptr = %p\n", memcpy_size, ptr);
+  CHECK_NE(REAL(memcpy), nullptr);
+  REAL(memcpy)(new_ptr, ptr, memcpy_size);
+  real_free(ptr);
+  return new_ptr;
 }
 
 } // namespace __asan

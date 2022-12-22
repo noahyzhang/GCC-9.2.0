@@ -118,77 +118,161 @@ static void *ReallocFromLocalPool(void *ptr, uptr size) {
   return new_ptr;
 }
 
-INTERCEPTOR(void, free, void *ptr) {
+INTERCEPTOR_EXPOSE(void, free, void *ptr) {
   GET_STACK_TRACE_FREE;
   if (UNLIKELY(IsInDlsymAllocPool(ptr))) {
     DeallocateFromLocalPool(ptr);
     return;
   }
-  asan_free(ptr, &stack, FROM_MALLOC);
+
+  if (ptr == nullptr) return;
+
+  if (check_malloced_by_asan(ptr)) {
+    asan_free(ptr, &stack, FROM_MALLOC);
+  } else {
+    real_free(ptr);
+  }
 }
 
 #if SANITIZER_INTERCEPT_CFREE
-INTERCEPTOR(void, cfree, void *ptr) {
+INTERCEPTOR_EXPOSE(void, cfree, void *ptr) {
   GET_STACK_TRACE_FREE;
   if (UNLIKELY(IsInDlsymAllocPool(ptr)))
     return;
-  asan_free(ptr, &stack, FROM_MALLOC);
+
+  if (ptr == nullptr) return;
+
+  if (check_malloced_by_asan(ptr)) {
+    asan_free(ptr, &stack, FROM_MALLOC);
+  } else {
+    real_free(ptr);
+  }
 }
 #endif // SANITIZER_INTERCEPT_CFREE
 
-INTERCEPTOR(void*, malloc, uptr size) {
+INTERCEPTOR_EXPOSE(void*, malloc, uptr size) {
   if (UNLIKELY(UseLocalPool()))
     // Hack: dlsym calls malloc before REAL(malloc) is retrieved from dlsym.
     return AllocateFromLocalPool(size);
   ENSURE_ASAN_INITED();
   GET_STACK_TRACE_MALLOC;
-  return asan_malloc(size, &stack);
+
+  if (in_range_asan(size)) {
+    return asan_malloc(size, &stack);
+  } else {
+    return real_malloc(size);
+  }
 }
 
-INTERCEPTOR(void*, calloc, uptr nmemb, uptr size) {
+INTERCEPTOR_EXPOSE(void*, calloc, uptr nmemb, uptr size) {
   if (UNLIKELY(UseLocalPool()))
     // Hack: dlsym calls calloc before REAL(calloc) is retrieved from dlsym.
     return AllocateFromLocalPool(nmemb * size);
   ENSURE_ASAN_INITED();
   GET_STACK_TRACE_MALLOC;
-  return asan_calloc(nmemb, size, &stack);
+
+  if (in_range_asan(nmemb * size)) {
+    return asan_calloc(nmemb, size, &stack);
+  } else {
+    return real_calloc(nmemb, size);
+  }
 }
 
-INTERCEPTOR(void*, realloc, void *ptr, uptr size) {
+INTERCEPTOR_EXPOSE(void*, realloc, void *ptr, uptr size) {
   if (UNLIKELY(IsInDlsymAllocPool(ptr)))
     return ReallocFromLocalPool(ptr, size);
   if (UNLIKELY(UseLocalPool()))
     return AllocateFromLocalPool(size);
   ENSURE_ASAN_INITED();
   GET_STACK_TRACE_MALLOC;
-  return asan_realloc(ptr, size, &stack);
+
+  // 旧指针为空
+  if (ptr == nullptr) {
+    if (in_range_asan(size)) {
+      return asan_malloc(size, &stack);
+    } else {
+      return real_malloc(size);
+    }
+  }
+
+  // 旧指针不为空，判断旧指针是出于 asan 还是 glibc malloc
+  bool old_ptr_type = check_malloced_by_asan(ptr);
+  // 新申请的内存大小为 0，则只需要 free 掉旧指针即可
+  if (size == 0) {
+    if (old_ptr_type) {
+      asan_free(ptr, &stack, FROM_MALLOC);
+      return nullptr;
+    } else {
+      real_free(ptr);
+      return nullptr;
+    }
+  }
+
+  // 新申请的内存大小不为 0
+  bool new_ptr_type = in_range_asan(size);
+  // 旧内存为 asan，新内存为 asan
+  if (old_ptr_type && new_ptr_type) {
+    return asan_realloc(ptr, size, &stack);
+  }
+  // 旧内存为 glibc，新内存为 glibc
+  if (!old_ptr_type && !new_ptr_type) {
+    return real_realloc(ptr, size);
+  }
+  // 旧内存为 glibc，新内存为 asan
+  if (!old_ptr_type && new_ptr_type) {
+    return realloc_glibc_to_asan_malloc(ptr, size, &stack);
+  } else {
+    return realloc_asan_to_glibc_malloc(ptr, size, &stack);
+  }
 }
 
 #if SANITIZER_INTERCEPT_MEMALIGN
-INTERCEPTOR(void*, memalign, uptr boundary, uptr size) {
+INTERCEPTOR_EXPOSE(void*, memalign, uptr boundary, uptr size) {
   GET_STACK_TRACE_MALLOC;
-  return asan_memalign(boundary, size, &stack, FROM_MALLOC);
+
+  if (in_range_asan(size)) {
+    return asan_memalign(boundary, size, &stack, FROM_MALLOC);
+  } else {
+    return real_memalign(boundary, size);
+  }
 }
 
-INTERCEPTOR(void*, __libc_memalign, uptr boundary, uptr size) {
+INTERCEPTOR_EXPOSE(void*, __libc_memalign, uptr boundary, uptr size) {
   GET_STACK_TRACE_MALLOC;
-  void *res = asan_memalign(boundary, size, &stack, FROM_MALLOC);
-  DTLS_on_libc_memalign(res, size);
-  return res;
+
+  if (in_range_asan(size)) {
+    void* res = asan_memalign(boundary, size, &stack, FROM_MALLOC);
+    DTLS_on_libc_memalign(res, size);
+    return res;
+  } else {
+    return real_memalign(boundary, size);
+  }
 }
 #endif // SANITIZER_INTERCEPT_MEMALIGN
 
 #if SANITIZER_INTERCEPT_ALIGNED_ALLOC
-INTERCEPTOR(void*, aligned_alloc, uptr boundary, uptr size) {
+INTERCEPTOR_EXPOSE(void*, aligned_alloc, uptr boundary, uptr size) {
   GET_STACK_TRACE_MALLOC;
-  return asan_aligned_alloc(boundary, size, &stack);
+
+  if (in_range_asan(size)) {
+    return asan_aligned_alloc(boundary, size, &stack);
+  } else {
+    return real_aligned_alloc(boundary, size);
+  }
 }
 #endif // SANITIZER_INTERCEPT_ALIGNED_ALLOC
 
-INTERCEPTOR(uptr, malloc_usable_size, void *ptr) {
+INTERCEPTOR_EXPOSE(uptr, malloc_usable_size, void *ptr) {
   GET_CURRENT_PC_BP_SP;
   (void)sp;
-  return asan_malloc_usable_size(ptr, pc, bp);
+
+  if (ptr == nullptr) return 0;
+
+  if (check_malloced_by_asan(ptr)) {
+    return asan_malloc_usable_size(ptr, pc, bp);
+  } else {
+    return real_malloc_usable_size(ptr);
+  }
 }
 
 #if SANITIZER_INTERCEPT_MALLOPT_AND_MALLINFO
@@ -211,22 +295,37 @@ INTERCEPTOR(int, mallopt, int cmd, int value) {
 }
 #endif // SANITIZER_INTERCEPT_MALLOPT_AND_MALLINFO
 
-INTERCEPTOR(int, posix_memalign, void **memptr, uptr alignment, uptr size) {
+INTERCEPTOR_EXPOSE(int, posix_memalign, void **memptr, uptr alignment, uptr size) {
   if (UNLIKELY(UseLocalPool()))
     return PosixMemalignFromLocalPool(memptr, alignment, size);
   GET_STACK_TRACE_MALLOC;
-  return asan_posix_memalign(memptr, alignment, size, &stack);
+
+  if (in_range_asan(size)) {
+    return asan_posix_memalign(memptr, alignment, size, &stack);
+  } else {
+    return real_posix_memalign(memptr, alignment, size);
+  }
 }
 
-INTERCEPTOR(void*, valloc, uptr size) {
+INTERCEPTOR_EXPOSE(void*, valloc, uptr size) {
   GET_STACK_TRACE_MALLOC;
-  return asan_valloc(size, &stack);
+
+  if (in_range_asan(size)) {
+    return asan_valloc(size, &stack);
+  } else {
+    return real_valloc(size);
+  }
 }
 
 #if SANITIZER_INTERCEPT_PVALLOC
-INTERCEPTOR(void*, pvalloc, uptr size) {
+INTERCEPTOR_EXPOSE(void*, pvalloc, uptr size) {
   GET_STACK_TRACE_MALLOC;
-  return asan_pvalloc(size, &stack);
+
+  if (in_range_asan(size)) {
+    return asan_pvalloc(size, &stack);
+  } else {
+    return real_pvalloc(size);
+  }
 }
 #endif // SANITIZER_INTERCEPT_PVALLOC
 

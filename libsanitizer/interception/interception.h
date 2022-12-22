@@ -144,6 +144,9 @@ const interpose_substitution substitution_##func_name[] \
 # define DECLARE_WRAPPER(ret_type, func, ...) \
      extern "C" ret_type func(__VA_ARGS__) \
      __attribute__((alias("__interceptor_" #func), visibility("default")));
+# define DECLARE_WRAPPER_HIDDEN(ret_type, func, ...) \
+     extern "C" ret_type func(__VA_ARGS__) \
+     __attribute__((alias("__interceptor_" #func), visibility("hidden")));
 #elif !SANITIZER_FUCHSIA
 # define WRAP(x) __interceptor_ ## x
 # define WRAPPER_NAME(x) "__interceptor_" #x
@@ -151,6 +154,9 @@ const interpose_substitution substitution_##func_name[] \
 # define DECLARE_WRAPPER(ret_type, func, ...) \
     extern "C" ret_type func(__VA_ARGS__) \
     __attribute__((weak, alias("__interceptor_" #func), visibility("default")));
+# define DECLARE_WRAPPER_HIDDEN(ret_type, func, ...) \
+    extern "C" ret_type func(__VA_ARGS__) \
+    __attribute__((weak, alias("__interceptor_" #func), visibility("hidden")));
 #endif
 
 #if SANITIZER_FUCHSIA
@@ -218,6 +224,20 @@ const interpose_substitution substitution_##func_name[] \
 #elif !SANITIZER_MAC
 
 #define INTERCEPTOR(ret_type, func, ...) \
+  DEFINE_REAL(ret_type, func, __VA_ARGS__) \
+  DECLARE_WRAPPER(ret_type, func, __VA_ARGS__) \
+  extern "C" \
+  INTERCEPTOR_ATTRIBUTE \
+  ret_type WRAP(func)(__VA_ARGS__)
+
+#define INTERCEPTOR_HIDDEN(ret_type, func, ...) \
+  DEFINE_REAL(ret_type, func, __VA_ARGS__) \
+  DECLARE_WRAPPER_HIDDEN(ret_type, func, __VA_ARGS__) \
+  extern "C" \
+  INTERCEPTOR_ATTRIBUTE \
+  ret_type WRAP(func)(__VA_ARGS__)
+
+#define INTERCEPTOR_EXPOSE(ret_type, func, ...) \
   DEFINE_REAL(ret_type, func, __VA_ARGS__) \
   DECLARE_WRAPPER(ret_type, func, __VA_ARGS__) \
   extern "C" \

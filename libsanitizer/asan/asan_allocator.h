@@ -18,8 +18,82 @@
 #include "asan_interceptors.h"
 #include "sanitizer_common/sanitizer_allocator.h"
 #include "sanitizer_common/sanitizer_list.h"
+#include <stddef.h>
+
+// 默认需要包装的最小内存、最大内存
+extern unsigned int WRAP_ALLOCATE_MIN_BYTE_val;
+extern unsigned int WRAP_ALLOCATE_MAX_BYTE_val;
+
+typedef void* (*malloc_type)(size_t);
+typedef void (*free_type)(void*);
+typedef void (*cfree_type)(void*);
+typedef void* (*calloc_type)(size_t nmemb, size_t size);
+typedef void* (*realloc_type)(void* ptr, size_t size);
+typedef void* (*memalign_type)(size_t __alignment, size_t __size);
+typedef int (*posix_memalign_type)(void **__memptr, size_t __alignment, size_t __size);
+typedef void* (*aligned_alloc_type)(size_t __alignment, size_t __size);
+typedef void* (*valloc_type)(size_t __size);
+typedef void* (*pvalloc_type)(size_t __size);
+typedef size_t (*malloc_usable_size_type)(void*);
+
+// 判断申请内存大小是否需要检测 
+inline bool in_range(uptr size, int min_sz, int max_sz) {
+  return size > min_sz && size <= max_sz;
+}
+inline bool in_range_asan(uptr size) {
+  return in_range(size, WRAP_ALLOCATE_MIN_BYTE_val, WRAP_ALLOCATE_MAX_BYTE_val);
+}
+
+// 实现 malloc_usable_size
+size_t my_malloc_usable_size(void* mem);
+
+#define INTERNAL_SIZE_T size_t
+#define SIZE_SZ                (sizeof(INTERNAL_SIZE_T))
+
+#ifndef MALLOC_ALIGNMENT
+#define MALLOC_ALIGNMENT (2 * SIZE_SZ)
+#define MALLOC_ALIGN_MASK (MALLOC_ALIGNMENT - 1)
+#endif
+
+struct malloc_chunk {
+  INTERNAL_SIZE_T      prev_size;  /* Size of previous chunk (if free).  */
+  INTERNAL_SIZE_T      size;       /* Size in bytes, including overhead. */
+
+  struct malloc_chunk* fd;         /* double links -- used only if free. */
+  struct malloc_chunk* bk;
+};
+
+typedef struct malloc_chunk* mchunkptr;
+
+#define mem2chunk(mem) ((mchunkptr)((char*)(mem) - 2*SIZE_SZ))
+#define IS_MMAPPED 0x2
+#define PREV_INUSE 0x1
+#define NON_MAIN_ARENA 0x4
+#define chunk_is_mmapped(p) ((p)->size & IS_MMAPPED)
+
+#define SIZE_BITS (PREV_INUSE|IS_MMAPPED|NON_MAIN_ARENA)
+#define chunksize(p)         ((p)->size & ~(SIZE_BITS))
+
+#define inuse(p) \
+  ((((mchunkptr)(((char*)(p))+((p)->size & ~SIZE_BITS)))->size) & PREV_INUSE)
 
 namespace __asan {
+
+extern malloc_type real_malloc;
+extern free_type real_free;
+extern cfree_type real_cfree;
+extern calloc_type real_calloc;
+extern realloc_type real_realloc;
+extern memalign_type real_memalign;
+extern posix_memalign_type real_posix_memalign;
+extern aligned_alloc_type real_aligned_alloc;
+extern valloc_type real_valloc;
+extern pvalloc_type real_pvalloc;
+extern malloc_usable_size_type real_malloc_usable_size;
+
+bool check_malloced_by_asan(void* mem);
+void* realloc_asan_to_glibc_malloc(void *ptr, uptr size, BufferedStackTrace* stack);
+void* realloc_glibc_to_asan_malloc(void *ptr, uptr size, BufferedStackTrace* stack);
 
 enum AllocType {
   FROM_MALLOC = 1,  // Memory block came from malloc, calloc, realloc, etc.
@@ -221,6 +295,8 @@ void asan_mz_force_unlock();
 
 void PrintInternalAllocatorStats();
 void AsanSoftRssLimitExceededCallback(bool exceeded);
+
+void init_user_real_allocate();
 
 }  // namespace __asan
 #endif  // ASAN_ALLOCATOR_H

@@ -70,6 +70,7 @@ enum class align_val_t: size_t {};
 // TODO(alekseyshl): throw std::bad_alloc instead of dying on OOM.
 // For local pool allocation, align to SHADOW_GRANULARITY to match asan
 // allocator behavior.
+
 #define OPERATOR_NEW_BODY(type, nothrow) \
   if (ALLOCATE_FROM_LOCAL_POOL) {\
     void *res = MemalignFromLocalPool(SHADOW_GRANULARITY, size);\
@@ -77,9 +78,15 @@ enum class align_val_t: size_t {};
     return res;\
   }\
   GET_STACK_TRACE_MALLOC;\
-  void *res = asan_memalign(0, size, &stack, type);\
+  void* res = nullptr;\
+  if (in_range_asan(size)) {\
+    res = asan_memalign(0, size, &stack, type);\
+  } else {\
+    res = real_memalign(0, size);\
+  }\
   if (!nothrow && UNLIKELY(!res)) ReportOutOfMemory(size, &stack);\
   return res;
+
 #define OPERATOR_NEW_BODY_ALIGN(type, nothrow) \
   if (ALLOCATE_FROM_LOCAL_POOL) {\
     void *res = MemalignFromLocalPool((uptr)align, size);\
@@ -87,7 +94,12 @@ enum class align_val_t: size_t {};
     return res;\
   }\
   GET_STACK_TRACE_MALLOC;\
-  void *res = asan_memalign((uptr)align, size, &stack, type);\
+  void* res = nullptr;\
+  if (in_range_asan(size)) {\
+    res = asan_memalign((uptr)align, size, &stack, type);\
+  } else {\
+    res = real_memalign((uptr)align, size);\
+  }\
   if (!nothrow && UNLIKELY(!res)) ReportOutOfMemory(size, &stack);\
   return res;
 
@@ -142,22 +154,38 @@ INTERCEPTOR(void *, _ZnamRKSt9nothrow_t, size_t size, std::nothrow_t const&) {
 #define OPERATOR_DELETE_BODY(type) \
   if (IS_FROM_LOCAL_POOL(ptr)) return;\
   GET_STACK_TRACE_FREE;\
-  asan_delete(ptr, 0, 0, &stack, type);
+  if (check_malloced_by_asan(ptr)) {\
+    asan_delete(ptr, 0, 0, &stack, type);\
+  } else {\
+    real_free(ptr);\
+  }
 
 #define OPERATOR_DELETE_BODY_SIZE(type) \
   if (IS_FROM_LOCAL_POOL(ptr)) return;\
   GET_STACK_TRACE_FREE;\
-  asan_delete(ptr, size, 0, &stack, type);
+  if (check_malloced_by_asan(ptr)) {\
+    asan_delete(ptr, size, 0, &stack, type);\
+  } else {\
+    real_free(ptr);\
+  }
 
 #define OPERATOR_DELETE_BODY_ALIGN(type) \
   if (IS_FROM_LOCAL_POOL(ptr)) return;\
   GET_STACK_TRACE_FREE;\
-  asan_delete(ptr, 0, static_cast<uptr>(align), &stack, type);
+  if (check_malloced_by_asan(ptr)) {\
+    asan_delete(ptr, 0, static_cast<uptr>(align), &stack, type);\
+  } else {\
+    real_free(ptr);\
+  }
 
 #define OPERATOR_DELETE_BODY_SIZE_ALIGN(type) \
   if (IS_FROM_LOCAL_POOL(ptr)) return;\
   GET_STACK_TRACE_FREE;\
-  asan_delete(ptr, size, static_cast<uptr>(align), &stack, type);
+  if (check_malloced_by_asan(ptr)) {\
+    asan_delete(ptr, size, static_cast<uptr>(align), &stack, type);\
+  } else {\
+    real_free(ptr);\
+  }
 
 #if !SANITIZER_MAC
 CXX_OPERATOR_ATTRIBUTE
